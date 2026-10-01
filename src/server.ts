@@ -4,8 +4,6 @@ import { randomUUID } from "crypto";
 
 import redis from "redis";
 
-
-
 const redisClient = redis.createClient({
     url: "redis://localhost:6379"
 });
@@ -21,6 +19,14 @@ app.get("/product/:id", async (req, res) => {
     const lockToken = randomUUID();
     const lockKey = `lock:product:${req.params.id}`;
     const productId = req.params.id;
+
+    const MAX_WAIT_MS = 10000;
+    const RETRY_DELAY_MS = 100;
+
+    const baseTtl = 60;
+    const jitter = Math.floor(Math.random() * 30);
+    const ttl = baseTtl + jitter;
+
     const cachedProduct = await redisClient.get(`product:${productId}`);
     if (cachedProduct === "NOT_FOUND") {
         return res.status(404).json({
@@ -34,22 +40,22 @@ app.get("/product/:id", async (req, res) => {
     const lock = await redisClient.set(
         lockKey,
         lockToken,
-        { NX: true, EX: 10 }
+        { NX: true, EX: 20 }
     );
 
-    if (lock === "OK"){
+    if (lock === "OK") {
         console.log("🔒 LOCK ACQUIRED", productId);
-    
+
         const query = `SELECT products.id, products.name, products.description, products.price, products.version FROM products WHERE products.id = $1`;
         const result = await client.query(query, [productId]);
         console.log("🐌 GET READ FROM DB", result.rows[0]);
         await new Promise(resolve => setTimeout(resolve, 800));
 
 
-        if (result.rows.length === 0){
+        if (result.rows.length === 0) {
             await redisClient.setEx(
                 `product:${productId}`,
-                30,
+                ttl,
                 "NOT_FOUND"
             );
             return res.status(404).json({ error: "Product not found" });
@@ -67,18 +73,16 @@ app.get("/product/:id", async (req, res) => {
             return res.json(product);
         }
 
-        const baseTtl = 60;
-        const jitter = Math.floor(Math.random() * 30);
-        const ttl = baseTtl + jitter;
 
-        await redisClient.setEx(`product:${productId}`, ttl, JSON.stringify(product)); 
+
+        await redisClient.setEx(`product:${productId}`, ttl, JSON.stringify(product));
         await redisClient.eval(RELEASE_LOCK_SCRIPT, {
             keys: [lockKey],
             arguments: [lockToken],
         });
     }
-
-    while (true) {
+    let waited = 0;
+    while (waited < MAX_WAIT_MS) {
         await new Promise(resolve => setTimeout(resolve, 100));
 
         const cachedProduct = await redisClient.get(`product:${productId}`);
@@ -91,7 +95,61 @@ app.get("/product/:id", async (req, res) => {
         if (cachedProduct) {
             return res.json(JSON.parse(cachedProduct));
         }
+
+        const lockExists = await redisClient.exists(lockKey);
+        if (!lockExists) {
+            const newLockToken = randomUUID();
+            const newLock = await redisClient.set(
+                lockKey,
+                newLockToken,
+                { NX: true, EX: 10 }
+            );
+
+            if (newLock === "OK") {
+                try{
+                    console.log("🔒 LOCK ACQUIRED", productId);
+                    const query = `SELECT products.id, products.name, products.description, products.price, products.version FROM products WHERE products.id = $1`;
+                    const result = await client.query(query, [productId]);
+
+                    const product = result.rows[0];
+                    if (result.rows.length === 0) {
+                        await redisClient.setEx(
+                            `product:${productId}`,
+                            ttl,
+                            "NOT_FOUND"
+                        );
+                        return res.status(404).json({ error: "Product not found" });
+                    }
+
+                    await redisClient.setEx(
+                        `product:${productId}`,
+                        ttl,
+                        JSON.stringify(product)
+                    );
+                    return res.json(product);
+                }catch(err){
+                    console.error("Error fetching product from DB:", err);
+                    return res.status(500).json({
+                        error: "Internal server error"
+                    });
+                }finally{
+                    await redisClient.eval(RELEASE_LOCK_SCRIPT, {
+                        keys: [lockKey],
+                        arguments: [newLockToken],
+                    });
+                }
+            }
+            await new Promise(resolve =>
+                setTimeout(resolve, RETRY_DELAY_MS)
+            );
+            waited += RETRY_DELAY_MS;
+        }
+
     }
+
+        return res.status(503).json({
+            error: "Unable to fetch product"
+        });
 });
 
 //This is called cache-aside invalidation pattern.
@@ -105,12 +163,12 @@ app.put("/product/:id", async (req, res) => {
         WHERE id = $2
         RETURNING id, name, description, price, version
     `;
-    
+
     const result = await client.query(query, [price, productId]);
     if (result.rows.length === 0) {
         return res.status(404).json({ error: "Product not found" });
     }
-    
+
     await redisClient.del(`product:${productId}`);
     return res.json(result.rows[0]);
 })
@@ -118,7 +176,7 @@ app.put("/product/:id", async (req, res) => {
 
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
-  console.log(`Server is running on port ${PORT}`);
+    console.log(`Server is running on port ${PORT}`);
 });
 
 
