@@ -4,6 +4,8 @@ import { randomUUID } from "crypto";
 
 import redis from "redis";
 
+
+
 const redisClient = redis.createClient({
     url: "redis://localhost:6379"
 });
@@ -12,6 +14,8 @@ redisClient.on("error", (err) => console.log("Redis Client Error", err));
 
 await redisClient.connect();
 const app = express();
+
+app.use(express.json());
 
 app.get("/product/:id", async (req, res) => {
     const lockToken = randomUUID();
@@ -53,6 +57,25 @@ app.get("/product/:id", async (req, res) => {
         }
     }
 });
+
+//This is called cache-aside invalidation pattern.
+app.put("/product/:id", async (req, res) => {
+    const productId = req.params.id;
+    const { price } = req.body;
+    const query = `
+        UPDATE products
+        SET price = $1
+        WHERE id = $2
+        RETURNING id, name, description, price
+    `;
+    const result = await client.query(query, [price, productId]);
+    if (result.rows.length === 0) {
+        return res.status(404).json({ error: "Product not found" });
+    }
+    
+    await redisClient.del(`product:${productId}`);
+    return res.json(result.rows[0]);
+})
 
 
 const PORT = process.env.PORT || 3000;
