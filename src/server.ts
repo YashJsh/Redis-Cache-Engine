@@ -4,13 +4,30 @@ import { randomUUID } from "crypto";
 
 import redis from "redis";
 
+const RELEASE_LOCK_SCRIPT = `
+if redis.call("get", KEYS[1]) == ARGV[1] then
+    return redis.call("del", KEYS[1])
+else
+    return 0
+end
+`;
+
 const redisClient = redis.createClient({
-    url: "redis://localhost:6379"
+    url: "redis://localhost:6379",
+    socket : {
+        reconnectStrategy : false
+    }
 });
 
 redisClient.on("error", (err) => console.log("Redis Client Error", err));
 
-await redisClient.connect();
+try {
+    await redisClient.connect();
+    console.log("✅ Redis connected");
+} catch (error) {
+    console.log("⚠️ Redis unavailable, starting without cache");
+}
+
 const app = express();
 
 app.use(express.json());
@@ -27,7 +44,16 @@ app.get("/product/:id", async (req, res) => {
     const jitter = Math.floor(Math.random() * 30);
     const ttl = baseTtl + jitter;
 
-    const cachedProduct = await redisClient.get(`product:${productId}`);
+    let redisAvailable = true;
+    let cachedProduct: string | null = null;
+
+    try {
+        cachedProduct = await redisClient.get(`product:${productId}`);
+    } catch (error) {
+        console.error("⚠️ Redis unavailable, bypassing cache");
+        redisAvailable = false;
+    }
+
     if (cachedProduct === "NOT_FOUND") {
         return res.status(404).json({
             error: "Product not found"
@@ -36,7 +62,33 @@ app.get("/product/:id", async (req, res) => {
     if (cachedProduct) {
         return res.json(JSON.parse(cachedProduct));
     }
-    //In redis it is stored as : lock:product:1 : lockToken
+
+    if (!redisAvailable) {
+        console.log("⚠️ Redis unavailable → reading from PostgreSQL");
+        try{
+            const query = `
+            SELECT id, name, description, price, version
+            FROM products
+            WHERE id = $1
+            `;
+
+            const result = await client.query(query, [productId]);
+
+            if (result.rows.length === 0) {
+                return res.status(404).json({
+                    error: "Product not found"
+                });
+            }
+
+            return res.json(result.rows[0]);
+        }catch(err){
+            console.error("Error fetching product from DB");
+            return res.status(500).json({
+                error: "Internal server error"
+            });
+        }
+    }
+
     const lock = await redisClient.set(
         lockKey,
         lockToken,
@@ -180,10 +232,3 @@ app.listen(PORT, () => {
 });
 
 
-const RELEASE_LOCK_SCRIPT = `
-if redis.call("get", KEYS[1]) == ARGV[1] then
-    return redis.call("del", KEYS[1])
-else
-    return 0
-end
-`;
