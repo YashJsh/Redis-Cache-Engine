@@ -67,7 +67,11 @@ app.get("/product/:id", async (req, res) => {
             return res.json(product);
         }
 
-        await redisClient.setEx(`product:${productId}`, 60, JSON.stringify(product)); 
+        const baseTtl = 60;
+        const jitter = Math.floor(Math.random() * 30);
+        const ttl = baseTtl + jitter;
+
+        await redisClient.setEx(`product:${productId}`, ttl, JSON.stringify(product)); 
         await redisClient.eval(RELEASE_LOCK_SCRIPT, {
             keys: [lockKey],
             arguments: [lockToken],
