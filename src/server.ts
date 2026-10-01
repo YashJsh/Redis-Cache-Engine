@@ -22,6 +22,11 @@ app.get("/product/:id", async (req, res) => {
     const lockKey = `lock:product:${req.params.id}`;
     const productId = req.params.id;
     const cachedProduct = await redisClient.get(`product:${productId}`);
+    if (cachedProduct === "NOT_FOUND") {
+        return res.status(404).json({
+            error: "Product not found"
+        });
+    }
     if (cachedProduct) {
         return res.json(JSON.parse(cachedProduct));
     }
@@ -40,7 +45,13 @@ app.get("/product/:id", async (req, res) => {
         console.log("🐌 GET READ FROM DB", result.rows[0]);
         await new Promise(resolve => setTimeout(resolve, 800));
 
+
         if (result.rows.length === 0){
+            await redisClient.setEx(
+                `product:${productId}`,
+                30,
+                "NOT_FOUND"
+            );
             return res.status(404).json({ error: "Product not found" });
         }
         const product = result.rows[0];
@@ -67,6 +78,11 @@ app.get("/product/:id", async (req, res) => {
         await new Promise(resolve => setTimeout(resolve, 100));
 
         const cachedProduct = await redisClient.get(`product:${productId}`);
+        if (cachedProduct === "NOT_FOUND") {
+            return res.status(404).json({
+                error: "Product not found"
+            });
+        }
 
         if (cachedProduct) {
             return res.json(JSON.parse(cachedProduct));
