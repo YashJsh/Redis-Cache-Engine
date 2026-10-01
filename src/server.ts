@@ -34,13 +34,29 @@ app.get("/product/:id", async (req, res) => {
 
     if (lock === "OK"){
         console.log("🔒 LOCK ACQUIRED", productId);
-        const query = `SELECT products.id, products.name, products.description, products.price FROM products WHERE products.id = $1`;
+    
+        const query = `SELECT products.id, products.name, products.description, products.price, products.version FROM products WHERE products.id = $1`;
         const result = await client.query(query, [productId]);
+        console.log("🐌 GET READ FROM DB", result.rows[0]);
         await new Promise(resolve => setTimeout(resolve, 800));
+
         if (result.rows.length === 0){
             return res.status(404).json({ error: "Product not found" });
         }
-        await redisClient.setEx(`product:${productId}`, 60, JSON.stringify(result.rows[0])); 
+        const product = result.rows[0];
+
+        const versionResult = await client.query(
+            `SELECT version FROM products WHERE id = $1`,
+            [productId]
+        );
+        const currentVersion = versionResult.rows[0]?.version;
+
+        if (currentVersion !== product.version) {
+            console.log("⚠️ STALE READ - NOT CACHING", productId);
+            return res.json(product);
+        }
+
+        await redisClient.setEx(`product:${productId}`, 60, JSON.stringify(product)); 
         await redisClient.eval(RELEASE_LOCK_SCRIPT, {
             keys: [lockKey],
             arguments: [lockToken],
@@ -64,10 +80,12 @@ app.put("/product/:id", async (req, res) => {
     const { price } = req.body;
     const query = `
         UPDATE products
-        SET price = $1
+        SET price = $1,
+        version = version + 1
         WHERE id = $2
-        RETURNING id, name, description, price
+        RETURNING id, name, description, price, version
     `;
+    
     const result = await client.query(query, [price, productId]);
     if (result.rows.length === 0) {
         return res.status(404).json({ error: "Product not found" });
